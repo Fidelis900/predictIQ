@@ -46,7 +46,17 @@ export interface TTSJob {
   createdAt: Date;
   updatedAt: Date;
   bypassCache?: boolean;
+  /**
+   * Identity of the credential that created this job (the API key itself,
+   * or the JWT `sub` claim). Used to enforce per-tenant access on
+   * getJob/listJobs so one credential cannot read another's jobs.
+   * `ANONYMOUS_OWNER` when no auth is configured (single-tenant deployment).
+   */
+  owner: string;
 }
+
+/** Owner tag used for jobs created when no auth is configured. */
+export const ANONYMOUS_OWNER = "anonymous";
 
 // ---------------------------------------------------------------------------
 // Rate limiting (issue #531)
@@ -415,12 +425,18 @@ export class AuthError extends Error {
   }
 }
 
-export function authenticate(credential: string | undefined, auth: AuthConfig): void {
+/**
+ * Verify `credential` against `auth` and return a stable tenant identity for it:
+ * - API key auth: the key itself is the tenant boundary.
+ * - JWT auth: the `sub` claim if present, otherwise the raw credential.
+ * Throws `AuthError` if the credential is missing or invalid.
+ */
+export function authenticate(credential: string | undefined, auth: AuthConfig): string {
   if (!credential) throw new AuthError("Missing credential");
 
   if (auth.type === "apikey") {
     if (!auth.keys.includes(credential)) throw new AuthError("Invalid API key");
-    return;
+    return credential;
   }
 
   const parts = credential.split(".");
@@ -438,6 +454,8 @@ export function authenticate(credential: string | undefined, auth: AuthConfig): 
   if (payload.exp !== undefined && payload.exp < Math.floor(Date.now() / 1000)) {
     throw new AuthError("JWT expired");
   }
+
+  return typeof payload.sub === "string" && payload.sub ? payload.sub : credential;
 }
 
 // ---------------------------------------------------------------------------
@@ -717,8 +735,18 @@ export class TTSService {
 
   /**
    * Build one circuit breaker per configured TTS provider.  The breaker
-   * wraps a thin async action that accepts (text, voice) and delegates to
-   * the raw provider implementation.
+   * wraps the *entire retried request* (raw provider call + backoff
+   * retries), not a single raw call.  This is deliberate: firing the
+   * breaker once per retry attempt would let one failed user request
+   * inflate the breaker's failure count by up to `maxRetries + 1`, tripping
+   * it far earlier than the configured threshold intends, and — once
+   * open — a retry loop wrapped *around* the breaker would keep retrying
+   * the "circuit open" error with full exponential backoff instead of
+   * failing fast (see issue #1131). By wrapping retries *inside* the
+   * breaker action, opossum's `fire()` is called exactly once per external
+   * request, records exactly one success/failure per request, and — when
+   * already open — rejects immediately without invoking the action (and
+   * therefore without running any retry/backoff logic) at all.
    */
   private _initCircuitBreakers(): void {
     const cbCfg: Required<CircuitBreakerConfig> = {
@@ -738,14 +766,19 @@ export class TTSService {
       rollingCountTimeout: cbCfg.rollingWindowMs,
       // Half-open retry delay
       resetTimeout: cbCfg.halfOpenIntervalMs,
-      // Per-call timeout (counted as a failure)
+      // Per-call timeout (counted as a failure). Bounds the whole retried
+      // request, since the action below includes the retry/backoff loop.
       timeout: cbCfg.timeoutMs,
     };
 
     if (this.config.elevenlabs) {
       const elBreaker = new CircuitBreaker(
         async (text: string, voice: TTSVoice) =>
-          generateElevenLabs(text, voice, this.config.elevenlabs!, cbCfg.timeoutMs),
+          withRetry(
+            () => generateElevenLabs(text, voice, this.config.elevenlabs!, cbCfg.timeoutMs),
+            this._retryConfig(),
+            "provider:elevenlabs"
+          ),
         { ...opossumOptions, name: "elevenlabs" }
       );
       elBreaker.on("open",     () => console.warn("[CircuitBreaker] ElevenLabs circuit OPENED — fast-failing"));
@@ -757,7 +790,11 @@ export class TTSService {
     if (this.config.google) {
       const gBreaker = new CircuitBreaker(
         async (text: string, voice: TTSVoice) =>
-          generateGoogle(text, voice, this.config.google!, cbCfg.timeoutMs),
+          withRetry(
+            () => generateGoogle(text, voice, this.config.google!, cbCfg.timeoutMs),
+            this._retryConfig(),
+            "provider:google"
+          ),
         { ...opossumOptions, name: "google" }
       );
       gBreaker.on("open",     () => console.warn("[CircuitBreaker] Google TTS circuit OPENED — fast-failing"));
@@ -765,6 +802,13 @@ export class TTSService {
       gBreaker.on("close",    () => console.info ("[CircuitBreaker] Google TTS circuit CLOSED — recovered"));
       this.breakers.set("google", gBreaker);
     }
+  }
+
+  private _retryConfig(): RetryConfig {
+    return {
+      maxRetries: this.config.retry?.maxRetries ?? 3,
+      maxDelayMs: this.config.retry?.maxDelayMs ?? 60_000,
+    };
   }
 
   /**
@@ -801,7 +845,7 @@ export class TTSService {
     rateLimitKey?: string,
     bypassCache?: boolean
   ): string {
-    if (this.config.auth) authenticate(credential, this.config.auth);
+    const owner = this._resolveOwner(credential);
 
     // Rate limiting
     if (this.rateLimiter && rateLimitKey) {
@@ -821,6 +865,7 @@ export class TTSService {
       createdAt: new Date(),
       updatedAt: new Date(),
       bypassCache: bypassCache || false,
+      owner,
     };
     jobStore.set(id, job);
 
@@ -837,11 +882,43 @@ export class TTSService {
     return id;
   }
 
-  getJob(id: string): TTSJob | undefined {
-    return jobStore.get(id);
+  /**
+   * Resolve `credential` to a stable tenant identity, enforcing auth if
+   * configured. Used both to tag newly created jobs with their owner and to
+   * check ownership on lookup, so the two paths can never disagree.
+   */
+  private _resolveOwner(credential?: string): string {
+    if (!this.config.auth) return ANONYMOUS_OWNER;
+    return authenticate(credential, this.config.auth);
   }
 
-  listJobs(status?: TTSJob["status"]): TTSJob[] {
+  /**
+   * Look up a job by ID, scoped to the requesting credential's tenant.
+   * Returns `undefined` both when the job doesn't exist and when it exists
+   * but belongs to a different tenant — the two cases are indistinguishable
+   * to the caller so a credential cannot probe for other tenants' job IDs.
+   */
+  getJob(id: string, credential?: string): TTSJob | undefined {
+    const owner = this._resolveOwner(credential);
+    const job = jobStore.get(id);
+    if (!job || job.owner !== owner) return undefined;
+    return job;
+  }
+
+  /** List jobs belonging to the requesting credential's tenant, optionally filtered by status. */
+  listJobs(status?: TTSJob["status"], credential?: string): TTSJob[] {
+    const owner = this._resolveOwner(credential);
+    const all = Array.from(jobStore.values()).filter((j) => j.owner === owner);
+    return status ? all.filter((j) => j.status === status) : all;
+  }
+
+  /**
+   * Returns jobs across *all* tenants, optionally filtered by status.
+   * For internal operational use only (health checks, queue-depth metrics)
+   * — never expose this over a tenant-facing API, since it bypasses the
+   * ownership scoping that `listJobs`/`getJob` enforce.
+   */
+  listAllJobsUnscoped(status?: TTSJob["status"]): TTSJob[] {
     const all = Array.from(jobStore.values());
     return status ? all.filter((j) => j.status === status) : all;
   }
@@ -921,8 +998,11 @@ export class TTSService {
   }
 
   /**
-   * Try the requested provider with retry; if it fails and a fallback is available, try that.
-   * Transient errors (429, 5xx) are retried with exponential backoff + full jitter.
+   * Try the requested provider; if it fails and a fallback is available, try that.
+   * Transient errors (429, 5xx) are retried with exponential backoff + full jitter
+   * *inside* `_callProvider`'s circuit breaker action (see `_initCircuitBreakers`),
+   * so each provider is attempted at most once per call here — retries are not
+   * layered on top of the breaker, which would defeat its fast-fail behavior.
    * Non-retriable errors (400, 401, 403) propagate immediately.
    */
   private async _generateWithFallback(job: TTSJob): Promise<Buffer> {
@@ -931,17 +1011,8 @@ export class TTSService {
     const hasFallback =
       fallback === "google" ? !!this.config.google : !!this.config.elevenlabs;
 
-    const retryConfig: RetryConfig = {
-      maxRetries: this.config.retry?.maxRetries ?? 3,
-      maxDelayMs: this.config.retry?.maxDelayMs ?? 60_000,
-    };
-
     try {
-      return await withRetry(
-        () => this._callProvider(primary, job.text, job.voice),
-        retryConfig,
-        `provider:${primary}`
-      );
+      return await this._callProvider(primary, job.text, job.voice);
     } catch (primaryErr) {
       const errMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
       console.error(`[TTSService] Primary provider "${primary}" failed: ${errMsg}`);
@@ -954,11 +1025,7 @@ export class TTSService {
 
       console.warn(`[TTSService] Falling back to "${fallback}"`);
       try {
-        return await withRetry(
-          () => this._callProvider(fallback, job.text, job.voice),
-          retryConfig,
-          `provider:${fallback}`
-        );
+        return await this._callProvider(fallback, job.text, job.voice);
       } catch (fallbackErr) {
         const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
         console.error(`[TTSService] Fallback provider "${fallback}" also failed: ${fbMsg}`);
@@ -980,31 +1047,44 @@ export class TTSService {
     if (provider === "elevenlabs") {
       if (!this.config.elevenlabs) throw new TTSProviderError("elevenlabs", "ElevenLabs config missing");
       if (breaker) {
-        try {
-          return await breaker.fire(text, voice) as Buffer;
-        } catch (err) {
-          // Re-wrap open-circuit errors as TTSProviderError so callers get a
-          // consistent error type and a meaningful 503 status code.
-          if (err instanceof Error && err.message.includes("open")) {
-            throw new TTSProviderError("elevenlabs", `Circuit breaker OPEN: ${err.message}`, 503);
-          }
-          throw err;
-        }
+        // Retries happen inside the breaker's action (see
+        // _initCircuitBreakers) — fire() is called exactly once here per
+        // external request, and rejects immediately without retry/backoff
+        // when the circuit is already open (fail-fast, not retried by any
+        // outer caller — see _generateWithFallback).
+        return await this._fireBreaker("elevenlabs", breaker, text, voice);
       }
-      return generateElevenLabs(text, voice, this.config.elevenlabs, this.cbConfig.timeoutMs);
+      return withRetry(
+        () => generateElevenLabs(text, voice, this.config.elevenlabs!, this.cbConfig.timeoutMs),
+        this._retryConfig(),
+        "provider:elevenlabs"
+      );
     } else {
       if (!this.config.google) throw new TTSProviderError("google", "Google TTS config missing");
       if (breaker) {
-        try {
-          return await breaker.fire(text, voice) as Buffer;
-        } catch (err) {
-          if (err instanceof Error && err.message.includes("open")) {
-            throw new TTSProviderError("google", `Circuit breaker OPEN: ${err.message}`, 503);
-          }
-          throw err;
-        }
+        return await this._fireBreaker("google", breaker, text, voice);
       }
-      return generateGoogle(text, voice, this.config.google, this.cbConfig.timeoutMs);
+      return withRetry(
+        () => generateGoogle(text, voice, this.config.google!, this.cbConfig.timeoutMs),
+        this._retryConfig(),
+        "provider:google"
+      );
+    }
+  }
+
+  private async _fireBreaker(
+    provider: TTSProvider,
+    breaker: CircuitBreaker,
+    text: string,
+    voice: TTSVoice
+  ): Promise<Buffer> {
+    try {
+      return await breaker.fire(text, voice) as Buffer;
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("open")) {
+        throw new TTSProviderError(provider, `Circuit breaker OPEN: ${err.message}`, 503);
+      }
+      throw err;
     }
   }
 
