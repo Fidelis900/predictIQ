@@ -19,6 +19,7 @@ jobs:
   validate-secrets:
     name: Validate Required Secrets
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check required secrets are set
         run: |
@@ -53,12 +54,13 @@ jobs:
   security-scan:
     name: Checkov Security Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: validate-secrets
     steps:
       - uses: actions/checkout@v4
 
       - name: Run Checkov
-        uses: bridgecrewio/checkov-action@v12
+        uses: bridgecrewio/checkov-action@7b972723c44fb3d256283fac96fae5d7c1894bb7 # v12
         with:
           directory: infrastructure/terraform
           framework: terraform
@@ -73,6 +75,7 @@ jobs:
   plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [validate-secrets, security-scan]
     strategy:
       matrix:
@@ -91,12 +94,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@451ce2a72e8d729a59ebeaacab82dbce58e7af4c # v6
         with:
           role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', matrix.environment)] }}
           aws-region: ${{ env.AWS_REGION }}
@@ -136,6 +139,9 @@ jobs:
   apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
+    # Kept short: this job holds a DynamoDB state lock and max-parallel: 1
+    # means a hung apply blocks every other environment behind it.
+    timeout-minutes: 15
     needs: plan
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     strategy:
@@ -161,12 +167,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@451ce2a72e8d729a59ebeaacab82dbce58e7af4c # v6
         with:
           role-to-assume: ${{ secrets[format('AWS_ROLE_{0}', matrix.environment)] }}
           aws-region: ${{ env.AWS_REGION }}
