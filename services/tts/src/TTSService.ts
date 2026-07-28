@@ -638,6 +638,14 @@ export class TTSService {
       resetTimeout: cbCfg.halfOpenIntervalMs,
       // Per-call timeout (counted as a failure)
       timeout: cbCfg.timeoutMs,
+      // Issue #1135: 4xx TTSProviderErrors (bad voice, invalid credential, ...)
+      // are client/config mistakes, not upstream provider health signals.
+      // Excluding them from breaker accounting stops a handful of bad
+      // requests from tripping the breaker for every other user of the
+      // provider. Genuine 5xx/network failures (no statusCode, or >= 500)
+      // still count as failures.
+      errorFilter: (err: unknown) =>
+        err instanceof TTSProviderError && err.statusCode >= 400 && err.statusCode < 500,
     };
 
     if (this.config.elevenlabs) {
