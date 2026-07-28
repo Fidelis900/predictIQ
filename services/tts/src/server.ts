@@ -29,6 +29,7 @@ import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { trace, context } from "@opentelemetry/api";
 import { rateLimitKeyGenerator } from "./rateLimitKey";
 import { initTracing } from "./tracing";
+import { createRedisSharedStore } from "./SharedStore";
 
 // ---------------------------------------------------------------------------
 // Tracing
@@ -76,6 +77,13 @@ const config: TTSConfig = {
     maxRetries: parseInt(process.env.TTS_MAX_RETRIES || "3", 10),
     maxDelayMs: parseInt(process.env.TTS_MAX_DELAY_MS || "60000", 10),
   },
+  // Issue #1133: job store, rate limiting, and cache are process-local Maps
+  // by default, which break correctness under horizontal scaling (a GET
+  // /tts/job/:id can land on a different pod than the one that processed
+  // the job, and rate limits multiply by replica count). Set REDIS_URL when
+  // running more than one instance behind a load balancer so state is
+  // shared across replicas.
+  sharedStore: process.env.REDIS_URL ? createRedisSharedStore(process.env.REDIS_URL) : undefined,
 };
 
 // ---------------------------------------------------------------------------
@@ -217,7 +225,7 @@ app.get("/health/live", createLivenessHandler(healthChecker));
  *   "status": "pending"
  * }
  */
-app.post("/tts/enqueue", (req: Request, res: Response) => {
+app.post("/tts/enqueue", async (req: Request, res: Response) => {
   try {
     const { text, voiceId, provider } = req.body;
     const rateLimitKey = req.ip || "unknown";
@@ -232,7 +240,9 @@ app.post("/tts/enqueue", (req: Request, res: Response) => {
       return res.status(400).json({ error: `Unknown voice: ${voiceId}` });
     }
 
-    const jobId = service.enqueue(text, voice, provider, undefined, rateLimitKey, bypassCache);
+    // enqueueAsync so rate limiting is enforced consistently across
+    // replicas when REDIS_URL / config.sharedStore is configured (#1133).
+    const jobId = await service.enqueueAsync(text, voice, provider, undefined, rateLimitKey, bypassCache);
     res.json({ jobId, status: "pending" });
   } catch (error: any) {
     const statusCode = error.statusCode || 500;
@@ -254,8 +264,10 @@ app.post("/tts/enqueue", (req: Request, res: Response) => {
  *   "updatedAt": "2024-01-15T10:30:05Z"
  * }
  */
-app.get("/tts/job/:id", (req: Request, res: Response) => {
-  const job = service.getJob(req.params.id);
+app.get("/tts/job/:id", async (req: Request, res: Response) => {
+  // getJobAsync falls back to the shared store so polling succeeds
+  // regardless of which replica originally processed the job (#1133).
+  const job = await service.getJobAsync(req.params.id);
   if (!job) {
     return res.status(404).json({ error: "Job not found" });
   }
@@ -275,9 +287,9 @@ app.get("/tts/job/:id", (req: Request, res: Response) => {
  *   ...
  * ]
  */
-app.get("/tts/jobs", (req: Request, res: Response) => {
+app.get("/tts/jobs", async (req: Request, res: Response) => {
   const status = req.query.status as any;
-  const jobs = service.listJobs(status);
+  const jobs = await service.listJobsAsync(status);
   res.json(jobs);
 });
 
