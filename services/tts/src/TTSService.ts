@@ -19,6 +19,7 @@ import path from "path";
 import { createHash } from "crypto";
 import { trace, SpanStatusCode, Span } from "@opentelemetry/api";
 import CircuitBreaker from "opossum";
+import type { SharedStoreConfig } from "./SharedStore";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -388,6 +389,12 @@ export interface TTSConfig {
   circuitBreaker?: CircuitBreakerConfig;
   /** Retry config for transient provider errors — omit to use defaults */
   retry?: RetryConfig;
+  /**
+   * Shared, cross-replica backing (e.g. Redis) for job status, rate
+   * limiting, and cache (issue #1133). Omit to keep process-local in-memory
+   * state, which only gives correct results for a single instance.
+   */
+  sharedStore?: SharedStoreConfig;
   /**
    * TTL in milliseconds for completed/errored jobs before they're evicted
    * from the in-memory job store. Omit to use the default (1 hour).
@@ -769,6 +776,14 @@ export class TTSService {
       // Per-call timeout (counted as a failure). Bounds the whole retried
       // request, since the action below includes the retry/backoff loop.
       timeout: cbCfg.timeoutMs,
+      // Issue #1135: 4xx TTSProviderErrors (bad voice, invalid credential, ...)
+      // are client/config mistakes, not upstream provider health signals.
+      // Excluding them from breaker accounting stops a handful of bad
+      // requests from tripping the breaker for every other user of the
+      // provider. Genuine 5xx/network failures (no statusCode, or >= 500)
+      // still count as failures.
+      errorFilter: (err: unknown) =>
+        err instanceof TTSProviderError && err.statusCode >= 400 && err.statusCode < 500,
     };
 
     if (this.config.elevenlabs) {
@@ -833,6 +848,11 @@ export class TTSService {
 
   /**
    * Enqueue a TTS job and return its ID immediately.
+   *
+   * Rate limiting and job visibility are process-local here — use
+   * `enqueueAsync` when `config.sharedStore` is configured so multiple
+   * replicas behind a load balancer see consistent state (issue #1133).
+   *
    * @param credential API key or JWT Bearer token (required when auth is configured).
    * @param rateLimitKey IP address or user ID for rate limiting (e.g. "ip:1.2.3.4" or "user:abc").
    * @param bypassCache If true, skip cache lookup and always generate fresh audio.
@@ -852,34 +872,49 @@ export class TTSService {
       this.rateLimiter.check(rateLimitKey);
     }
 
-    // Input sanitization
-    const sanitized = sanitizeInput(text);
+    const job = this._createJob(text, voice, provider, bypassCache, owner);
+    jobStore.set(job.id, job);
+    this._process(job).catch((err) => this._handleProcessError(job.id, err));
+    return job.id;
+  }
 
-    const id = makeId();
-    const job: TTSJob = {
-      id,
-      text: sanitized,
-      voice,
-      provider: provider ?? this.config.provider,
-      status: "pending",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      bypassCache: bypassCache || false,
-      owner,
-    };
-    jobStore.set(id, job);
+  /**
+   * Async equivalent of `enqueue`. When `config.sharedStore` is configured,
+   * rate limiting is enforced against the shared counter (consistent across
+   * replicas) and the job is written to the shared job store immediately so
+   * `getJobAsync` on another replica can see it right away, before
+   * processing even completes (issue #1133).
+   */
+  async enqueueAsync(
+    text: string,
+    voice: TTSVoice,
+    provider?: TTSProvider,
+    credential?: string,
+    rateLimitKey?: string,
+    bypassCache?: boolean
+  ): Promise<string> {
+    const owner = this._resolveOwner(credential);
 
-    this._process(job).catch((err) => {
-      const j = jobStore.get(id);
-      if (j) {
-        j.status = "error";
-        j.error = err instanceof Error ? err.message : String(err);
-        j.updatedAt = new Date();
-        console.error(`[TTSService] Job ${id} failed: ${j.error}`);
+    if (rateLimitKey) {
+      const sharedRateLimit = this.config.sharedStore?.rateLimitStore;
+      if (sharedRateLimit && this.config.rateLimit) {
+        const count = await sharedRateLimit.incr(rateLimitKey, this.config.rateLimit.windowMs);
+        if (count > this.config.rateLimit.maxRequests) {
+          throw new RateLimitError(
+            `Rate limit exceeded for key "${rateLimitKey}": ${count}/${this.config.rateLimit.maxRequests} in ${this.config.rateLimit.windowMs}ms`
+          );
+        }
+      } else if (this.rateLimiter) {
+        this.rateLimiter.check(rateLimitKey);
       }
-    });
+    }
 
-    return id;
+    const job = this._createJob(text, voice, provider, bypassCache, owner);
+    jobStore.set(job.id, job);
+    await this._persistJob(job);
+
+    this._process(job).catch((err) => this._handleProcessError(job.id, err));
+    return job.id;
   }
 
   /**
@@ -894,6 +929,8 @@ export class TTSService {
 
   /**
    * Look up a job by ID, scoped to the requesting credential's tenant.
+   * Process-local lookup only — use `getJobAsync` under `config.sharedStore`
+   * so polling succeeds regardless of which replica handled the job (issue #1133).
    * Returns `undefined` both when the job doesn't exist and when it exists
    * but belongs to a different tenant — the two cases are indistinguishable
    * to the caller so a credential cannot probe for other tenants' job IDs.
@@ -905,11 +942,41 @@ export class TTSService {
     return job;
   }
 
+  /**
+   * Looks up a job locally first (fast path for the replica that processed
+   * it), falling back to the shared store so polling succeeds regardless of
+   * which replica originally handled the job (issue #1133). Scoped to the
+   * requesting credential's tenant like `getJob`, on both the local and
+   * shared-store paths.
+   */
+  async getJobAsync(id: string, credential?: string): Promise<TTSJob | undefined> {
+    const owner = this._resolveOwner(credential);
+    const local = jobStore.get(id);
+    if (local) return local.owner === owner ? local : undefined;
+    const remote = await this.config.sharedStore?.jobStore?.getJob(id);
+    if (!remote || remote.owner !== owner) return undefined;
+    return remote;
+  }
+
   /** List jobs belonging to the requesting credential's tenant, optionally filtered by status. */
   listJobs(status?: TTSJob["status"], credential?: string): TTSJob[] {
     const owner = this._resolveOwner(credential);
     const all = Array.from(jobStore.values()).filter((j) => j.owner === owner);
     return status ? all.filter((j) => j.status === status) : all;
+  }
+
+  /**
+   * Async equivalent of `listJobs`, preferring the shared store when
+   * configured so listings are consistent across replicas (issue #1133).
+   * Scoped to the requesting credential's tenant like `listJobs`.
+   */
+  async listJobsAsync(status?: TTSJob["status"], credential?: string): Promise<TTSJob[]> {
+    const owner = this._resolveOwner(credential);
+    if (this.config.sharedStore?.jobStore) {
+      const all = await this.config.sharedStore.jobStore.listJobs(status);
+      return all.filter((j) => j.owner === owner);
+    }
+    return this.listJobs(status, credential);
   }
 
   /**
@@ -925,6 +992,8 @@ export class TTSService {
 
   /**
    * Synchronous generation — awaits completion and returns the output path.
+   * Uses `enqueueAsync` internally so rate limiting is consistent across
+   * replicas when `config.sharedStore` is configured.
    * @param rateLimitKey IP address or user ID for rate limiting.
    * @param bypassCache If true, skip cache lookup and always generate fresh audio.
    */
@@ -936,7 +1005,7 @@ export class TTSService {
     rateLimitKey?: string,
     bypassCache?: boolean
   ): Promise<string> {
-    const id = this.enqueue(text, voice, provider, credential, rateLimitKey, bypassCache);
+    const id = await this.enqueueAsync(text, voice, provider, credential, rateLimitKey, bypassCache);
     return this._waitForJob(id);
   }
 
@@ -965,36 +1034,97 @@ export class TTSService {
   // Private
   // ---------------------------------------------------------------------------
 
+  /** Builds a pending TTSJob. Shared by `enqueue` and `enqueueAsync`. */
+  private _createJob(
+    text: string,
+    voice: TTSVoice,
+    provider: TTSProvider | undefined,
+    bypassCache: boolean | undefined,
+    owner: string
+  ): TTSJob {
+    const sanitized = sanitizeInput(text);
+    return {
+      id: makeId(),
+      text: sanitized,
+      voice,
+      provider: provider ?? this.config.provider,
+      status: "pending",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      bypassCache: bypassCache || false,
+      owner,
+    };
+  }
+
+  /** Writes a job to the shared store, if one is configured (issue #1133). No-op otherwise. */
+  private async _persistJob(job: TTSJob): Promise<void> {
+    if (this.config.sharedStore?.jobStore) {
+      await this.config.sharedStore.jobStore.setJob(job);
+    }
+  }
+
+  private _handleProcessError(id: string, err: unknown): void {
+    const job = jobStore.get(id);
+    if (!job) return;
+    job.status = "error";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.updatedAt = new Date();
+    console.error(`[TTSService] Job ${id} failed: ${job.error}`);
+    this._persistJob(job).catch((persistErr) =>
+      console.error(`[TTSService] Failed to persist job ${id} error state: ${persistErr}`)
+    );
+  }
+
+  /** Prefers the shared cache store when configured so cache hit rate isn't split across replicas (issue #1133). */
+  private async _cacheGet(key: string): Promise<Buffer | undefined> {
+    const shared = this.config.sharedStore?.cacheStore;
+    if (shared) return shared.get(key);
+    return this.cache?.get(key);
+  }
+
+  private async _cacheSet(key: string, buffer: Buffer): Promise<void> {
+    const shared = this.config.sharedStore?.cacheStore;
+    if (shared) {
+      await shared.set(key, buffer, this.config.cache?.ttlMs ?? 86_400_000);
+      return;
+    }
+    this.cache?.set(key, buffer);
+  }
+
   private async _process(job: TTSJob): Promise<void> {
     job.status = "processing";
     job.updatedAt = new Date();
+    await this._persistJob(job);
 
-    const cacheKey = this.cache && !job.bypassCache
+    const cachingEnabled = (this.cache || this.config.sharedStore?.cacheStore) && !job.bypassCache;
+    const cacheKey = cachingEnabled
       ? AudioCache.key(job.text, job.voice.voiceId, job.provider)
       : null;
 
     // Cache hit — write cached buffer to disk and skip provider call
-    if (cacheKey && this.cache) {
-      const cached = this.cache.get(cacheKey);
+    if (cacheKey) {
+      const cached = await this._cacheGet(cacheKey);
       if (cached) {
         const outputPath = await saveAudio(cached, this.config.outputDir, job.id);
         job.outputPath = outputPath;
         job.status = "done";
         job.updatedAt = new Date();
+        await this._persistJob(job);
         return;
       }
     }
 
     const buffer = await this._generateWithFallback(job);
 
-    if (cacheKey && this.cache) {
-      this.cache.set(cacheKey, buffer);
+    if (cacheKey) {
+      await this._cacheSet(cacheKey, buffer);
     }
 
     const outputPath = await saveAudio(buffer, this.config.outputDir, job.id);
     job.outputPath = outputPath;
     job.status = "done";
     job.updatedAt = new Date();
+    await this._persistJob(job);
   }
 
   /**
