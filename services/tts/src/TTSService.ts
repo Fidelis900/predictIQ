@@ -378,6 +378,17 @@ export interface TTSConfig {
   circuitBreaker?: CircuitBreakerConfig;
   /** Retry config for transient provider errors — omit to use defaults */
   retry?: RetryConfig;
+  /**
+   * TTL in milliseconds for completed/errored jobs before they're evicted
+   * from the in-memory job store. Omit to use the default (1 hour).
+   */
+  jobTtlMs?: number;
+  /**
+   * Retention period in milliseconds for generated audio files in
+   * `outputDir` before they're deleted by the periodic cleanup sweep.
+   * Omit to use the default (24 hours).
+   */
+  audioRetentionMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,8 +460,28 @@ export const VOICES: Record<string, TTSVoice> = {
 
 const jobStore = new Map<string, TTSJob>();
 
+/** Default TTL for completed/errored jobs before eviction: 1 hour. */
+export const DEFAULT_JOB_TTL_MS = 60 * 60 * 1000;
+
 function makeId(): string {
   return `tts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Evict terminal-state (done/error) jobs older than `ttlMs`, keeping
+ * jobStore bounded under sustained traffic. Pending/processing jobs are
+ * never evicted here.
+ */
+export function evictExpiredJobs(ttlMs: number): void {
+  const now = Date.now();
+  for (const [id, job] of jobStore) {
+    if (
+      (job.status === "done" || job.status === "error") &&
+      now - job.updatedAt.getTime() >= ttlMs
+    ) {
+      jobStore.delete(id);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +491,8 @@ function makeId(): string {
 async function generateElevenLabs(
   text: string,
   voice: TTSVoice,
-  config: NonNullable<TTSConfig["elevenlabs"]>
+  config: NonNullable<TTSConfig["elevenlabs"]>,
+  timeoutMs: number = DEFAULT_CB_CONFIG.timeoutMs
 ): Promise<Buffer> {
   const tracer = trace.getTracer("tts-service");
   return tracer.startActiveSpan("elevenlabs.generate", async (span: Span) => {
@@ -471,6 +503,12 @@ async function generateElevenLabs(
 
       const modelId = config.modelId ?? "eleven_multilingual_v2";
       const url = `https://api.elevenlabs.io/v1/text-to-speech/${voice.voiceId}`;
+
+      // Tie an AbortController to the breaker's timeout so a timed-out call
+      // actually cancels the in-flight HTTP request instead of letting it
+      // run to completion in the background.
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
 
       let res: Response;
       try {
@@ -486,12 +524,18 @@ async function generateElevenLabs(
             model_id: modelId,
             voice_settings: { stability: 0.5, similarity_boost: 0.75 },
           }),
+          signal: controller.signal,
         });
       } catch (networkErr) {
-        const msg = `Network error calling ElevenLabs: ${String(networkErr)}`;
+        const isAbort = networkErr instanceof Error && networkErr.name === "AbortError";
+        const msg = isAbort
+          ? `ElevenLabs request aborted after exceeding timeout of ${timeoutMs}ms`
+          : `Network error calling ElevenLabs: ${String(networkErr)}`;
         console.error(`[TTSService] ${msg}`);
         span.setStatus({ code: SpanStatusCode.ERROR, message: msg });
         throw new TTSProviderError("elevenlabs", msg);
+      } finally {
+        clearTimeout(abortTimer);
       }
 
       if (!res.ok) {
@@ -515,7 +559,8 @@ async function generateElevenLabs(
 async function generateGoogle(
   text: string,
   voice: TTSVoice,
-  config: NonNullable<TTSConfig["google"]>
+  config: NonNullable<TTSConfig["google"]>,
+  timeoutMs: number = DEFAULT_CB_CONFIG.timeoutMs
 ): Promise<Buffer> {
   const tracer = trace.getTracer("tts-service");
   return tracer.startActiveSpan("google.generate", async (span: Span) => {
@@ -527,7 +572,10 @@ async function generateGoogle(
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { TextToSpeechClient } = require("@google-cloud/text-to-speech") as {
         TextToSpeechClient: new (opts: object) => {
-          synthesizeSpeech: (req: object) => Promise<[{ audioContent: Buffer | string }]>;
+          synthesizeSpeech: (
+            req: object,
+            options?: object
+          ) => Promise<[{ audioContent: Buffer | string }]>;
         };
       };
 
@@ -535,11 +583,17 @@ async function generateGoogle(
 
       let response: { audioContent: Buffer | string };
       try {
-        [response] = await client.synthesizeSpeech({
-          input: { text },
-          voice: { languageCode: voice.language, name: voice.voiceId },
-          audioConfig: { audioEncoding: "MP3" },
-        });
+        // Pass a gax deadline so the underlying gRPC call is actually
+        // cancelled at the timeout boundary instead of running in the
+        // background after the circuit breaker gives up on it.
+        [response] = await client.synthesizeSpeech(
+          {
+            input: { text },
+            voice: { languageCode: voice.language, name: voice.voiceId },
+            audioConfig: { audioEncoding: "MP3" },
+          },
+          { timeout: timeoutMs }
+        );
       } catch (err) {
         const msg = `Google TTS error: ${String(err)}`;
         console.error(`[TTSService] ${msg}`);
@@ -578,6 +632,38 @@ export async function mergeAudioFiles(inputPaths: string[], outputPath: string):
   return outputPath;
 }
 
+/** Default retention period for generated audio files: 24 hours. */
+export const DEFAULT_AUDIO_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Delete files in `outputDir` whose mtime is older than `retentionMs`.
+ * Guards against unbounded disk growth since saveAudio() never deletes
+ * what it writes. Missing directory or per-file races are ignored.
+ */
+export async function cleanupOldAudioFiles(outputDir: string, retentionMs: number): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(outputDir);
+  } catch {
+    return;
+  }
+
+  const now = Date.now();
+  await Promise.all(
+    entries.map(async (name) => {
+      const filePath = path.join(outputDir, name);
+      try {
+        const stat = await fs.stat(filePath);
+        if (stat.isFile() && now - stat.mtimeMs >= retentionMs) {
+          await fs.unlink(filePath);
+        }
+      } catch {
+        // File may have been removed concurrently; ignore.
+      }
+    })
+  );
+}
+
 // ---------------------------------------------------------------------------
 // TTSService
 // ---------------------------------------------------------------------------
@@ -600,6 +686,7 @@ export class TTSService {
    *   - timeoutMs      : 10 000 ms per call
    */
   private breakers: Map<TTSProvider, CircuitBreaker> = new Map();
+  private cbConfig: Required<CircuitBreakerConfig> = DEFAULT_CB_CONFIG;
 
   constructor(config: TTSConfig) {
     this.config = config;
@@ -611,6 +698,20 @@ export class TTSService {
     if (config.cache) {
       this.cache = new AudioCache(config.cache);
     }
+    const jobTtlMs = config.jobTtlMs ?? DEFAULT_JOB_TTL_MS;
+    // Evict completed/errored jobs past their TTL every minute to keep
+    // jobStore memory bounded (MAX_QUEUE_DEPTH only guards pending/processing).
+    setInterval(() => evictExpiredJobs(jobTtlMs), 60_000).unref();
+
+    const audioRetentionMs = config.audioRetentionMs ?? DEFAULT_AUDIO_RETENTION_MS;
+    // Sweep outputDir every 15 minutes so generated .mp3 files don't
+    // accumulate forever and fill the (often small, ephemeral) disk.
+    setInterval(() => {
+      cleanupOldAudioFiles(this.config.outputDir, audioRetentionMs).catch((err) => {
+        console.error(`[TTSService] Audio cleanup sweep failed: ${String(err)}`);
+      });
+    }, 15 * 60_000).unref();
+
     this._initCircuitBreakers();
   }
 
@@ -624,6 +725,7 @@ export class TTSService {
       ...DEFAULT_CB_CONFIG,
       ...(this.config.circuitBreaker ?? {}),
     };
+    this.cbConfig = cbCfg;
 
     const opossumOptions: CircuitBreaker.Options = {
       // Trip the breaker when ≥ openThreshold failures occur in the window.
@@ -643,7 +745,7 @@ export class TTSService {
     if (this.config.elevenlabs) {
       const elBreaker = new CircuitBreaker(
         async (text: string, voice: TTSVoice) =>
-          generateElevenLabs(text, voice, this.config.elevenlabs!),
+          generateElevenLabs(text, voice, this.config.elevenlabs!, cbCfg.timeoutMs),
         { ...opossumOptions, name: "elevenlabs" }
       );
       elBreaker.on("open",     () => console.warn("[CircuitBreaker] ElevenLabs circuit OPENED — fast-failing"));
@@ -655,7 +757,7 @@ export class TTSService {
     if (this.config.google) {
       const gBreaker = new CircuitBreaker(
         async (text: string, voice: TTSVoice) =>
-          generateGoogle(text, voice, this.config.google!),
+          generateGoogle(text, voice, this.config.google!, cbCfg.timeoutMs),
         { ...opossumOptions, name: "google" }
       );
       gBreaker.on("open",     () => console.warn("[CircuitBreaker] Google TTS circuit OPENED — fast-failing"));
@@ -889,7 +991,7 @@ export class TTSService {
           throw err;
         }
       }
-      return generateElevenLabs(text, voice, this.config.elevenlabs);
+      return generateElevenLabs(text, voice, this.config.elevenlabs, this.cbConfig.timeoutMs);
     } else {
       if (!this.config.google) throw new TTSProviderError("google", "Google TTS config missing");
       if (breaker) {
@@ -902,7 +1004,7 @@ export class TTSService {
           throw err;
         }
       }
-      return generateGoogle(text, voice, this.config.google);
+      return generateGoogle(text, voice, this.config.google, this.cbConfig.timeoutMs);
     }
   }
 
