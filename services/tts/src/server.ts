@@ -100,6 +100,19 @@ const healthChecker = new HealthChecker(config, service);
 const app: Express = express();
 const port = process.env.PORT || 3000;
 
+// Security headers — applied to every response (JSON error bodies included).
+// Mirrors services/api/src/security.rs's security_headers_middleware.
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; frame-ancestors 'none'",
+  );
+  next();
+});
+
 // Middleware
 app.use(express.json());
 
@@ -279,8 +292,9 @@ app.get("/tts/job/:id", async (req: Request, res: Response) => {
   try {
     // getJobAsync falls back to the shared store so polling succeeds
     // regardless of which replica originally processed the job (#1133).
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const credential = extractCredential(req);
-    const job = await service.getJobAsync(req.params.id, credential);
+    const job = await service.getJobAsync(id, credential);
     if (!job) {
       // Same response whether the job doesn't exist or belongs to another
       // tenant, so a credential can't distinguish the two by probing IDs.
