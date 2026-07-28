@@ -28,6 +28,17 @@ import {
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { trace, context } from "@opentelemetry/api";
 import { rateLimitKeyGenerator } from "./rateLimitKey";
+import { initTracing } from "./tracing";
+
+// ---------------------------------------------------------------------------
+// Tracing
+// ---------------------------------------------------------------------------
+
+// Issue #1134: initTracing() was defined but never called anywhere, so every
+// tracer.startActiveSpan(...) call ran against the default no-op global
+// tracer provider. Must run once, before any request handling, so the
+// HttpInstrumentation and OTLP exporter are wired up in time.
+initTracing();
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -347,12 +358,15 @@ app.use((err: any, req: Request, res: Response, next: any) => {
 // Server startup
 // ---------------------------------------------------------------------------
 
-app.listen(port, () => {
-  console.log(`🎙️  TTS Service listening on port ${port}`);
-  console.log(`📊 Health check: GET http://localhost:${port}/health`);
-  console.log(`🔍 Readiness probe: GET http://localhost:${port}/health/ready`);
-  console.log(`💓 Liveness probe: GET http://localhost:${port}/health/live`);
-  console.log(`🎵 TTS endpoints: POST http://localhost:${port}/tts/enqueue`);
-});
+// Guarded so importing this module (e.g. from tests) doesn't bind a real port.
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`🎙️  TTS Service listening on port ${port}`);
+    console.log(`📊 Health check: GET http://localhost:${port}/health`);
+    console.log(`🔍 Readiness probe: GET http://localhost:${port}/health/ready`);
+    console.log(`💓 Liveness probe: GET http://localhost:${port}/health/live`);
+    console.log(`🎵 TTS endpoints: POST http://localhost:${port}/tts/enqueue`);
+  });
+}
 
 export default app;
