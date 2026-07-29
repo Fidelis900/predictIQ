@@ -78,14 +78,18 @@ pub struct Statistics {
     pub total_markets: i64,
     pub active_markets: i64,
     pub resolved_markets: i64,
-    pub total_volume: f64,
+    /// Exact decimal string (NUMERIC in the DB), matching the on-chain volume
+    /// string convention — avoids float rounding error when summing volumes.
+    pub total_volume: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeaturedMarket {
     pub id: i64,
     pub title: String,
-    pub volume: f64,
+    /// Exact decimal string (NUMERIC in the DB), matching the on-chain volume
+    /// string convention — avoids float rounding error when summing volumes.
+    pub volume: String,
     pub ends_at: DateTime<Utc>,
 }
 
@@ -227,7 +231,7 @@ impl Database {
                         COUNT(*)::BIGINT AS total_markets, \
                         COUNT(*) FILTER (WHERE status = 'active')::BIGINT AS active_markets, \
                         COUNT(*) FILTER (WHERE status = 'resolved')::BIGINT AS resolved_markets, \
-                        COALESCE(SUM(total_volume), 0)::DOUBLE PRECISION AS total_volume \
+                        COALESCE(SUM(total_volume), 0)::NUMERIC::TEXT AS total_volume \
                     FROM markets \
                     WHERE deleted_at IS NULL",
                 )
@@ -237,7 +241,7 @@ impl Database {
                     total_markets: row.try_get::<i64, _>("total_markets")?,
                     active_markets: row.try_get::<i64, _>("active_markets")?,
                     resolved_markets: row.try_get::<i64, _>("resolved_markets")?,
-                    total_volume: row.try_get::<f64, _>("total_volume")?,
+                    total_volume: row.try_get::<String, _>("total_volume")?,
                 })
             })
             .await?;
@@ -259,10 +263,10 @@ impl Database {
             .cache
             .get_or_set_json(&key, ttl, || async move {
                 let rows = self.with_timeout("featured_markets", sqlx::query(
-                    "SELECT id, title, total_volume, ends_at \
+                    "SELECT id, title, total_volume::TEXT AS total_volume, ends_at \
                     FROM markets \
                     WHERE status = 'active' AND deleted_at IS NULL \
-                    ORDER BY total_volume DESC, ends_at ASC \
+                    ORDER BY markets.total_volume DESC, ends_at ASC \
                     LIMIT $1",
                 )
                 .bind(limit)
@@ -273,7 +277,7 @@ impl Database {
                     markets.push(FeaturedMarket {
                         id: row.try_get::<i64, _>("id")?,
                         title: row.try_get::<String, _>("title")?,
-                        volume: row.try_get::<f64, _>("total_volume")?,
+                        volume: row.try_get::<String, _>("total_volume")?,
                         ends_at: row.try_get::<DateTime<Utc>, _>("ends_at")?,
                     });
                 }
