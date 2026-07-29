@@ -821,7 +821,7 @@ impl Database {
         .bind(message_id)
         .bind(event_type)
         .bind(email)
-        .fetch_one(&self.pool)).await.unwrap_or(0);
+        .fetch_one(&self.pool)).await?;
         Ok(count > 0)
     }
 
@@ -1058,6 +1058,35 @@ impl Database {
         let mut hasher = Sha256::new();
         hasher.update(raw_key.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+}
+
+impl Database {
+    /// Test-only constructor that builds a `Database` backed by a lazy pool.
+    ///
+    /// The pool is created with `connect_lazy` so no actual TCP connection is
+    /// made at construction time — tests that never execute queries can use
+    /// this without a running Postgres instance.  Tests that *do* execute
+    /// queries will receive an error immediately because the pool acquire
+    /// timeout is set to 1 ms and no real database is present.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(cache: RedisCache, metrics: Metrics) -> Self {
+        // connect_lazy accepts any syntactically valid postgres URL and defers
+        // the actual TCP dial until the first query is executed.  Tests that
+        // need a real DB should use `Database::new()` with a live URL instead.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            // Fail fast on any query attempt so tests that call DB methods get a
+            // quick error rather than hanging until the OS connection timeout.
+            .acquire_timeout(Duration::from_millis(1))
+            .connect_lazy("postgres://test:test@localhost/test")
+            .expect("connect_lazy must not fail with a valid URL");
+        Self {
+            pool,
+            cache,
+            metrics,
+            query_timeout: Duration::from_millis(50),
+        }
     }
 }
 

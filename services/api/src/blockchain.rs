@@ -1345,20 +1345,37 @@ impl BlockchainClient {
         http: Client,
         retry_attempts: u32,
     ) -> Self {
+        use crate::config::ContractKeySchema;
+        use crate::db::Database;
+        let db = Database::new_for_test(cache.clone(), metrics.clone());
         Self {
             http,
             rpc_url,
             network: "testnet".to_string(),
             contract_id: "test-contract".to_string(),
+            key_schema: ContractKeySchema {
+                version: "1.0.0".to_string(),
+                market: "market:{id}".to_string(),
+                platform_stats: "platform:stats".to_string(),
+                user_bets: "user_bets:{id}".to_string(),
+                oracle_result: "oracle_result:{id}".to_string(),
+                health_check: "platform:stats".to_string(),
+            },
             retry_attempts,
             retry_base_delay_ms: 10,
+            rpc_backoff_jitter_factor: 0.0,
             event_poll_interval: Duration::from_millis(50),
             tx_poll_interval: Duration::from_millis(50),
             confirmation_ledger_lag: 1,
             sync_market_ids: vec![],
             cache,
+            db,
             metrics,
             monitor: Arc::new(MonitoringState::default()),
+            expected_passphrase: String::new(),
+            watched_tx_ttl: WATCHED_TX_TTL_DEFAULT,
+            watched_tx_max_size: WATCHED_TX_MAX_SIZE,
+            is_production: false,
         }
     }
 
