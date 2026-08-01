@@ -147,6 +147,14 @@ export interface CacheConfig {
   ttlMs: number;
   /** Max number of entries; oldest evicted when exceeded */
   maxEntries: number;
+  /**
+   * Max total bytes across all cached buffers; oldest entries are evicted
+   * (in addition to entry-count eviction) until the new entry fits. Since
+   * MAX_INPUT_LENGTH allows up to 5000 characters per request, synthesized
+   * buffers can be several MB each — without this, entry-count alone permits
+   * unbounded heap growth. Omit to disable byte-based eviction.
+   */
+  maxBytes?: number;
 }
 
 interface CacheEntry {
@@ -160,11 +168,13 @@ export interface CacheMetrics {
   misses: number;
   evictions: number;
   size: number;
+  /** Total bytes across all currently cached buffers */
+  bytes: number;
 }
 
 export class AudioCache {
   private store = new Map<string, CacheEntry>();
-  private metrics: CacheMetrics = { hits: 0, misses: 0, evictions: 0, size: 0 };
+  private metrics: CacheMetrics = { hits: 0, misses: 0, evictions: 0, size: 0, bytes: 0 };
 
   constructor(private config: CacheConfig) {}
 
@@ -179,6 +189,7 @@ export class AudioCache {
     if (Date.now() - entry.createdAt > this.config.ttlMs) {
       this.store.delete(key);
       this.metrics.size--;
+      this.metrics.bytes -= entry.buffer.length;
       this.metrics.misses++;
       return undefined;
     }
@@ -188,17 +199,33 @@ export class AudioCache {
   }
 
   set(key: string, buffer: Buffer): void {
-    if (this.store.size >= this.config.maxEntries) {
-      // Evict the oldest entry
-      const oldest = this.store.keys().next().value;
-      if (oldest !== undefined) {
-        this.store.delete(oldest);
-        this.metrics.evictions++;
-        this.metrics.size--;
+    const maxBytes = this.config.maxBytes;
+    // A buffer that alone exceeds the byte budget can never be cached without
+    // violating it, no matter what else gets evicted — so don't cache it.
+    if (maxBytes !== undefined && buffer.length > maxBytes) return;
+
+    while (this.store.size >= this.config.maxEntries) {
+      this._evictOldest();
+    }
+    if (maxBytes !== undefined) {
+      while (this.store.size > 0 && this.metrics.bytes + buffer.length > maxBytes) {
+        this._evictOldest();
       }
     }
+
     this.store.set(key, { buffer, createdAt: Date.now(), hits: 0 });
     this.metrics.size++;
+    this.metrics.bytes += buffer.length;
+  }
+
+  private _evictOldest(): void {
+    const oldest = this.store.keys().next().value;
+    if (oldest === undefined) return;
+    const entry = this.store.get(oldest)!;
+    this.store.delete(oldest);
+    this.metrics.evictions++;
+    this.metrics.size--;
+    this.metrics.bytes -= entry.buffer.length;
   }
 
   getMetrics(): Readonly<CacheMetrics> {
@@ -637,6 +664,35 @@ async function generateElevenLabs(
   });
 }
 
+interface GoogleTTSClient {
+  synthesizeSpeech: (
+    req: object,
+    options?: object
+  ) => Promise<[{ audioContent: Buffer | string }]>;
+}
+
+/**
+ * One TextToSpeechClient per distinct `google` config object, lazily created
+ * and cached for the lifetime of that config. Constructing the client sets up
+ * its credentials/auth (a gRPC channel, token fetch, etc.), so re-creating it
+ * on every synthesis call adds that setup cost to every request instead of
+ * once per process.
+ */
+const googleClientCache = new WeakMap<object, GoogleTTSClient>();
+
+function getGoogleClient(config: NonNullable<TTSConfig["google"]>): GoogleTTSClient {
+  let client = googleClientCache.get(config);
+  if (!client) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { TextToSpeechClient } = require("@google-cloud/text-to-speech") as {
+      TextToSpeechClient: new (opts: object) => GoogleTTSClient;
+    };
+    client = new TextToSpeechClient(config);
+    googleClientCache.set(config, client);
+  }
+  return client;
+}
+
 async function generateGoogle(
   text: string,
   voice: TTSVoice,
@@ -650,17 +706,7 @@ async function generateGoogle(
       span.setAttribute("tts.voice.id", voice.voiceId);
       span.setAttribute("tts.text.length", text.length);
 
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { TextToSpeechClient } = require("@google-cloud/text-to-speech") as {
-        TextToSpeechClient: new (opts: object) => {
-          synthesizeSpeech: (
-            req: object,
-            options?: object
-          ) => Promise<[{ audioContent: Buffer | string }]>;
-        };
-      };
-
-      const client = new TextToSpeechClient(config);
+      const client = getGoogleClient(config);
 
       let response: { audioContent: Buffer | string };
       try {

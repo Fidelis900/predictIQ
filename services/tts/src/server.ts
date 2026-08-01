@@ -74,6 +74,10 @@ const config: TTSConfig = {
   cache: {
     ttlMs: parseInt(process.env.TTS_CACHE_TTL_MS || "86400000", 10),
     maxEntries: parseInt(process.env.TTS_CACHE_MAX_ENTRIES || "1000", 10),
+    // Bounds total cached audio bytes, not just entry count — MAX_INPUT_LENGTH
+    // allows several-MB buffers per entry, so maxEntries alone permits
+    // gigabytes of heap growth. Default: 256 MiB.
+    maxBytes: parseInt(process.env.TTS_CACHE_MAX_BYTES || String(256 * 1024 * 1024), 10),
   },
   retry: {
     maxRetries: parseInt(process.env.TTS_MAX_RETRIES || "3", 10),
@@ -101,6 +105,26 @@ const healthChecker = new HealthChecker(config, service);
 
 const app: Express = express();
 const port = process.env.PORT || 3000;
+
+// Without an explicit trust proxy setting, Express derives req.ip from the
+// raw socket address. Deployed behind any reverse proxy/load balancer, every
+// request then appears to originate from the proxy's address, collapsing all
+// distinct clients into a single rate-limit bucket (req.ip is used both as
+// the Express-level rate-limit key below and as the TTSService rate-limit
+// key in the route handlers). TRUST_PROXY configures how many hops (or which
+// trusted subnets) sit between the client and this process so Express parses
+// X-Forwarded-For and populates req.ip with the real client address.
+// Defaults to 1 hop — a single load balancer, the common deployment topology
+// — override via the env var to match a different topology (e.g. "false" for
+// a direct/no-proxy deployment, a higher hop count, or a trusted-subnet
+// keyword Express recognizes, such as "loopback").
+const trustProxyEnv = process.env.TRUST_PROXY ?? "1";
+const trustProxySetting: number | boolean | string =
+  trustProxyEnv === "true" ? true
+  : trustProxyEnv === "false" ? false
+  : /^-?\d+$/.test(trustProxyEnv) ? Number(trustProxyEnv)
+  : trustProxyEnv;
+app.set("trust proxy", trustProxySetting);
 
 // Security headers — applied to every response (JSON error bodies included).
 // Mirrors services/api/src/security.rs's security_headers_middleware.
@@ -497,10 +521,25 @@ app.get("/tts/voices", (req: Request, res: Response) => {
 // Error handling
 // ---------------------------------------------------------------------------
 
-app.use((err: any, req: Request, res: Response, next: any) => {
+/**
+ * Final error-handling middleware. Respects `err.statusCode`/`err.status`
+ * when present — e.g. a SyntaxError thrown inside express.json() on a
+ * malformed JSON body carries `status`/`statusCode` 400 — and defaults to 500
+ * only when neither is set. 5xx keeps a generic message to avoid leaking
+ * internals; 4xx messages describe a client mistake and are safe to surface,
+ * matching how the route-level catch blocks already handle their errors.
+ */
+export function globalErrorHandler(err: any, req: Request, res: Response, next: NextFunction): void {
   console.error("Unhandled error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
+  const statusCode =
+    typeof err?.statusCode === "number" ? err.statusCode
+    : typeof err?.status === "number" ? err.status
+    : 500;
+  const message = statusCode >= 500 ? "Internal server error" : (err?.message || "Bad request");
+  res.status(statusCode).json({ error: message });
+}
+
+app.use(globalErrorHandler);
 
 // ---------------------------------------------------------------------------
 // Server startup
