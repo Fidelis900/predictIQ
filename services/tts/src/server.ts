@@ -116,6 +116,24 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // Middleware
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'none'"],
+        imgSrc: ["'self'"],
+        styleSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        connectSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+    frameguard: { action: "deny" },
+    referrerPolicy: { policy: "no-referrer" },
+  })
+);
 app.use(express.json());
 
 // Request logging
